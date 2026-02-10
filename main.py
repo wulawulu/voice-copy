@@ -124,48 +124,33 @@ def concat_segments(
     output_path: Path,
     temp_dir: Path,
 ) -> None:
+    """Use ffmpeg filter_complex to trim + concat in one pass."""
     ensure_ffmpeg()
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    part_files: List[Path] = []
-    for idx, seg in enumerate(segments):
-        part = temp_dir / f"seg_{idx:04d}.wav"
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-y",
-            "-ss",
-            f"{seg.start:.3f}",
-            "-to",
-            f"{seg.end:.3f}",
-            "-i",
-            str(audio_path),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            str(part),
-        ]
-        run_cmd(cmd)
-        part_files.append(part)
-
-    concat_list = temp_dir / "concat.txt"
-    with concat_list.open("w", encoding="utf-8") as f:
-        for part in part_files:
-            f.write(f"file '{part.as_posix()}'\n")
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    filter_parts: List[str] = []
+    for idx, seg in enumerate(segments):
+        filter_parts.append(
+            f"[0:a]atrim=start={seg.start:.3f}:end={seg.end:.3f},"
+            f"asetpts=PTS-STARTPTS[a{idx}]"
+        )
+
+    concat_inputs = "".join(f"[a{i}]" for i in range(len(segments)))
+    filter_complex = (
+        ";".join(filter_parts)
+        + f";{concat_inputs}concat=n={len(segments)}:v=0:a=1[out]"
+    )
+
     cmd = [
         "ffmpeg",
         "-nostdin",
         "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
         "-i",
-        str(concat_list),
+        str(audio_path),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[out]",
         "-ac",
         "1",
         "-ar",
