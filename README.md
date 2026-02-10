@@ -8,7 +8,7 @@ This is a local, offline CLI to:
 
 ## Requirements
 - Python 3.12+
-- `ffmpeg` in PATH
+- `ffmpeg` in PATH (for normalization and preview)
 - Local model runtimes for ASR and cloning (Python packages + model weights)
 
 ## Install
@@ -47,6 +47,10 @@ python main.py asr \
   --run-dir ./runs/run1
 ```
 
+Optional flags:
+- `--asr-attn sdpa` to avoid FlashAttention2 dependency
+- `--asr-model-path` to use a local model directory
+
 ### 4) Clone + synth
 ```bash
 python main.py synth \
@@ -76,3 +80,5 @@ python main.py preview --run-dir ./runs/run1 --speaker speaker_00
 - MP3/WAV input is supported; it is normalized to 16k mono WAV for consistent processing.
 - For best cloning quality, ensure each speaker has enough clean audio after concatenation.
 - To force offline mode, pre-download model weights and set `HF_HUB_OFFLINE=1`.
+- If FlashAttention2 is not installed, the ASR step will automatically fall back to `sdpa`.
+- VoxCPM relies on `modelscope` and requires `setuptools==69.5.1` for `pkg_resources`.
