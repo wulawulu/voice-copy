@@ -332,7 +332,128 @@ def asr_cmd(args: argparse.Namespace) -> None:
 
 
 def build_voxcpm_model(args: argparse.Namespace):
+    import torch
+    import json
+    import os
     from voxcpm import VoxCPM
+    from voxcpm.model.voxcpm import VoxCPMConfig, VoxCPMModel
+
+    # 检测设备
+    device = getattr(args, 'clone_device', None)
+    if not device:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    
+    if device == "cpu":
+        print("警告：在 CPU 上运行 VoxCPM 会非常慢，建议使用 GPU。")
+        print("正在应用 CPU 兼容性补丁...")
+        
+        # Patch scaled_dot_product_attention for CPU compatibility
+        from voxcpm.modules.minicpm4 import model as minicpm_model
+        original_forward_step = minicpm_model.MiniCPMAttention.forward_step
+        
+        def patched_forward_step(self, hidden_states, position_id, position_emb, kv_cache):
+            bsz = hidden_states.size(0)
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+            query_states = query_states.view(bsz, 1, self.num_heads, self.head_dim).transpose(1, 2)
+            key_states = key_states.view(bsz, 1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, 1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+            cos, sin = position_emb
+            from voxcpm.modules.minicpm4.model import apply_rotary_pos_emb
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+            key_cache, value_cache = kv_cache
+            key_cache[:, :, position_id, :] = key_states
+            value_cache[:, :, position_id, :] = value_states
+
+            # 修复 CPU 上的 attn_mask 维度问题和 GQA 问题
+            # 创建正确维度的 mask
+            attn_mask = torch.arange(key_cache.size(2), device=key_cache.device) <= position_id
+
+            query_states = query_states.contiguous()
+            key_cache_cont = key_cache.contiguous()
+            value_cache_cont = value_cache.contiguous()
+            
+            # 手动实现 GQA 注意力计算以支持 CPU
+            # query: (batch, num_heads, 1, head_dim)
+            # key/value: (batch, num_kv_heads, seq_len, head_dim)
+            bsz, num_heads, q_len, head_dim = query_states.shape
+            _, num_kv_heads, kv_len, _ = key_cache_cont.shape
+            
+            # 计算每个 query head 对应几个 kv head
+            num_queries_per_kv = num_heads // num_kv_heads
+            
+            # 扩展 key 和 value 以匹配 query 的头数
+            # (batch, num_kv_heads, seq_len, head_dim) -> (batch, num_kv_heads, 1, seq_len, head_dim)
+            key_cache_expanded = key_cache_cont.unsqueeze(2)
+            value_cache_expanded = value_cache_cont.unsqueeze(2)
+            
+            # (batch, num_kv_heads, 1, seq_len, head_dim) -> (batch, num_kv_heads, num_queries_per_kv, seq_len, head_dim)
+            key_cache_expanded = key_cache_expanded.expand(bsz, num_kv_heads, num_queries_per_kv, kv_len, head_dim)
+            value_cache_expanded = value_cache_expanded.expand(bsz, num_kv_heads, num_queries_per_kv, kv_len, head_dim)
+            
+            # (batch, num_kv_heads, num_queries_per_kv, seq_len, head_dim) -> (batch, num_heads, seq_len, head_dim)
+            key_cache_expanded = key_cache_expanded.reshape(bsz, num_heads, kv_len, head_dim)
+            value_cache_expanded = value_cache_expanded.reshape(bsz, num_heads, kv_len, head_dim)
+            
+            # 计算注意力分数
+            attn_weights = torch.matmul(query_states, key_cache_expanded.transpose(-2, -1)) / (head_dim ** 0.5)
+            
+            # 应用 mask: (seq_len,) -> (1, 1, 1, seq_len)
+            attn_mask = attn_mask.view(1, 1, 1, -1)
+            attn_weights = attn_weights.masked_fill(~attn_mask, float('-inf'))
+            
+            # softmax 和输出
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, value_cache_expanded)
+
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz,self.num_heads * self.head_dim)
+            attn_output = self.o_proj(attn_output)
+
+            return attn_output
+        
+        minicpm_model.MiniCPMAttention.forward_step = patched_forward_step
+    
+    print(f"使用设备: {device}")
+    
+    # Monkey patch VoxCPMModel.from_local 来强制使用指定设备
+    original_from_local = VoxCPMModel.from_local
+    
+    def patched_from_local(cls, path: str, optimize: bool = True, training: bool = False, lora_config = None):
+        # 读取并修改配置
+        config_path = os.path.join(path, "config.json")
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        
+        # 强制设置设备为 CPU
+        config_dict['device'] = device
+        
+        # 临时写入修改后的配置
+        config = VoxCPMConfig.model_validate(config_dict)
+        config.device = device
+        
+        # 保存原始配置内容
+        with open(config_path, 'r') as f:
+            original_config = f.read()
+        
+        try:
+            # 临时写入修改后的配置
+            with open(config_path, 'w') as f:
+                json.dump(config_dict, f)
+            
+            # 调用原始方法
+            return original_from_local(path, optimize, training, lora_config)
+        finally:
+            # 恢复原始配置
+            with open(config_path, 'w') as f:
+                f.write(original_config)
+    
+    # 应用 patch
+    VoxCPMModel.from_local = classmethod(patched_from_local)
 
     model_id = args.clone_model_path or args.clone_model_id
     kwargs = {
@@ -344,6 +465,10 @@ def build_voxcpm_model(args: argparse.Namespace):
     except TypeError:
         kwargs.pop("local_files_only", None)
         model = VoxCPM.from_pretrained(model_id, **kwargs)
+    finally:
+        # 恢复原始方法
+        VoxCPMModel.from_local = original_from_local
+    
     return model
 
 
@@ -509,6 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
     synth.add_argument("--clone-denoise", action=argparse.BooleanOptionalAction, default=True)
     synth.add_argument("--clone-retry-badcase", action=argparse.BooleanOptionalAction, default=True)
     synth.add_argument("--clone-local-files-only", action="store_true")
+    synth.add_argument("--clone-device", help="torch device, e.g. cuda:0 or cpu")
     synth.set_defaults(func=synth_cmd)
 
     preview = subparsers.add_parser("preview", help="play speaker audio or a file")
